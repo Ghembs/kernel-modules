@@ -4,16 +4,6 @@
  * Based on minivosc soundcard
  * original code:
  * Copyright (c) by Smilen Dimitrov <sd at imi.aau.dk>
- * Copyright (c) by Jaroslav Kysela <perex@perex.cz>
- * Copyright (c) Ahmet İnan <ainan at mathematik.uni-freiburg.de>
- * Copyright (c) by Takashi Iwai <tiwai@suse.de>
- *
- * sdio parts from sdio_raw.c
- * TODO need mail for reference
- * Copyright (c) by Lucifer
- *
- * with snippets from Ben Collins: Writing an ALSA driver
- * http://ben-collins.blogspot.com/2010/04/writing-alsa-driver.html
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -39,6 +29,7 @@
 #include <linux/mmc/card.h>
 #include <linux/mmc/core.h>
 #include <linux/mmc/host.h>
+#include <linux/version.h>
 
 MODULE_AUTHOR("Giuliano Gambacorta");
 MODULE_DESCRIPTION("SDIO sound card");

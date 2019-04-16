@@ -1,3 +1,25 @@
+/*
+ * Basic FIFO playback soundcard
+ *
+ * Based on minivosc soundcard
+ * original code:
+ * Copyright (c) by Smilen Dimitrov <sd at imi.aau.dk>
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
+ */
+
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -9,7 +31,7 @@
 #include <sound/initval.h>
 
 MODULE_AUTHOR("Giuliano Gambacorta");
-MODULE_DESCRIPTION("SDIO sound card");
+MODULE_DESCRIPTION("FIFO sound card");
 MODULE_LICENSE("GPL");
 MODULE_SUPPORTED_DEVICE("{{ALSA, FIFO PLAYBACK}}");
 
@@ -141,7 +163,7 @@ static int fifo_hw_free(struct snd_pcm_substream *ss)
 static int fifo_pcm_open(struct snd_pcm_substream *ss)
 {
 	struct fifo_device *mydev = ss->private_data;
-    printk(KERN_WARNING "opening this beautiful useless device qualcosa");
+    printk(KERN_WARNING "opening this beautiful useless device");
 
     mutex_lock(&mydev->cable_lock);
 
@@ -159,7 +181,7 @@ static int fifo_pcm_open(struct snd_pcm_substream *ss)
 static int fifo_pcm_close(struct snd_pcm_substream *ss)
 {
     struct fifo_device *mydev = ss->private_data;
-    printk(KERN_WARNING "closing this beautiful useless device qualcosa");
+    printk(KERN_WARNING "closing this beautiful useless device");
 
     mutex_lock(&mydev->cable_lock);
 
@@ -177,7 +199,7 @@ static int fifo_pcm_prepare(struct snd_pcm_substream *ss)
 	struct fifo_device *mydev = runtime->private_data;
 	unsigned int bps;
 
-    printk(KERN_WARNING "DIS IS PREPARE");
+    printk(KERN_WARNING "PREPARE");
 
     mydev->buf_pos = 0;
 
