@@ -38,6 +38,12 @@ MODULE_SUPPORTED_DEVICE("{{ALSA, FIFO PLAYBACK}}");
 
 #define SND_FIFO_DRIVER	"snd_fifo"
 
+/**
+ * TODO check aloop.c to create a stream from playback to a fifo, through the corresponding
+ * (and still missing) kernel library, instead that a stream from playback to capture
+ * probably the important method is copy_play_buf and the information in: snd_pcm_substream->runtime->dma_area
+ */
+
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;	/* Index 0-MAX */
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;	/* ID for this card */
 static int enable[SNDRV_CARDS] = {1, [1 ... (SNDRV_CARDS - 1)] = 0};
@@ -52,7 +58,8 @@ struct fifo_device
     struct mutex cable_lock;
 
     unsigned int buf_pos;
-    //unsigned int running;
+    unsigned int pcm_bps;
+    unsigned int running;
 
     struct snd_pcm_substream *substream;
 };
@@ -89,17 +96,20 @@ static struct snd_pcm_hardware fifo_pcm_hw =
 			 SNDRV_PCM_INFO_INTERLEAVED |
 			 SNDRV_PCM_INFO_BLOCK_TRANSFER |
 			 SNDRV_PCM_INFO_MMAP_VALID),
-	.formats          = (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_U8),
-	.rates            = SNDRV_PCM_RATE_8000_192000,
+	.formats          = (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S16_BE |
+						 SNDRV_PCM_FMTBIT_S32_LE | SNDRV_PCM_FMTBIT_S32_BE |
+						 SNDRV_PCM_FMTBIT_FLOAT_LE | SNDRV_PCM_FMTBIT_FLOAT_BE),
+	.rates            = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_192000,
 	.rate_min         = 8000,
 	.rate_max         = 192000,
 	.channels_min     = 1,
 	.channels_max     = 2,
-	.buffer_bytes_max = 32*48,
-	.period_bytes_min = 48,
-	.period_bytes_max = 48,
-	.periods_min      = 1,
-	.periods_max      = 32,
+	.buffer_bytes_max =	2 * 1024 * 1024,
+	.period_bytes_min =	64,
+	.period_bytes_max =	2 * 1024 * 1024,
+	.periods_min =		1,
+	.periods_max =		1024,
+	//.fifo_size =		0, // apparently useless
 };
 
 static struct snd_pcm_ops fifo_pcm_playback_ops =
