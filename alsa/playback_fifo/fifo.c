@@ -1,9 +1,10 @@
 /*
  * Basic FIFO playback soundcard
  *
- * Based on minivosc soundcard
- * original code:
- * Copyright (c) by Smilen Dimitrov <sd at imi.aau.dk>
+ * Copyright (c) by Giuliano Gambacorta <ggambacora88@gmail.com>
+ *
+ * Based on minivosc soundcard:
+ * Copyright (c) by Smilen Dimitrov <sd@imi.aau.dk>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -51,7 +52,7 @@ struct fifo_device
     struct mutex cable_lock;
 
     unsigned int buf_pos;
-    unsigned int running;
+    //unsigned int running;
 
     struct snd_pcm_substream *substream;
 };
@@ -88,12 +89,12 @@ static struct snd_pcm_hardware fifo_pcm_hw =
 			 SNDRV_PCM_INFO_INTERLEAVED |
 			 SNDRV_PCM_INFO_BLOCK_TRANSFER |
 			 SNDRV_PCM_INFO_MMAP_VALID),
-	.formats          = SNDRV_PCM_FMTBIT_U8,
-	.rates            = SNDRV_PCM_RATE_8000,
+	.formats          = (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_U8),
+	.rates            = SNDRV_PCM_RATE_8000_192000,
 	.rate_min         = 8000,
-	.rate_max         = 8000,
+	.rate_max         = 192000,
 	.channels_min     = 1,
-	.channels_max     = 1,
+	.channels_max     = 2,
 	.buffer_bytes_max = 32*48,
 	.period_bytes_min = 48,
 	.period_bytes_max = 48,
@@ -135,7 +136,22 @@ static struct platform_driver fifo_driver =
 // ======================= PCM PLAYBACK OPERATIONS ====================================
 static int fifo_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
-    return 0;
+	int ret = 0;
+	struct fifo_device *mydev = substream->private_data;
+	printk(KERN_WARNING "TRIGGERING this beautiful useless device");
+
+	switch (cmd)
+	{
+		case SNDRV_PCM_TRIGGER_START:
+			printk(KERN_WARNING "starting this beautiful useless device");
+			break;
+		case SNDRV_PCM_TRIGGER_STOP:
+			printk(KERN_WARNING "stopping this beautiful useless device");
+			break;
+		default:
+			ret = -EINVAL;
+	}
+    return ret;
 }
 
 static snd_pcm_uframes_t fifo_pcm_pointer(struct snd_pcm_substream *ss)
@@ -143,9 +159,12 @@ static snd_pcm_uframes_t fifo_pcm_pointer(struct snd_pcm_substream *ss)
     struct snd_pcm_runtime *runtime = ss->runtime;
     struct fifo_device *mydev = runtime->private_data;
 
+	printk(KERN_WARNING "POINTING this beautiful useless device somewhere");
+
     //fifo_pos_update(mydev);
 
-    return bytes_to_frames(runtime, mydev->buf_pos);
+    //return bytes_to_frames(runtime, mydev->buf_pos);
+    return runtime->buffer_size;
 }
 
 static int fifo_hw_params(struct snd_pcm_substream *ss,
