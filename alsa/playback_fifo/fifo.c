@@ -25,6 +25,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
+#include <linux/jiffies.h>
 
 #include <sound/core.h>
 #include <sound/control.h>
@@ -37,6 +38,9 @@ MODULE_LICENSE("GPL");
 MODULE_SUPPORTED_DEVICE("{{ALSA, FIFO PLAYBACK}}");
 
 #define SND_FIFO_DRIVER	"snd_fifo"
+
+#define byte_pos(x)	((x) / HZ)
+#define frac_pos(x)	((x) * HZ)
 
 /**
  * TODO check aloop.c to create a stream from playback to a fifo, through the corresponding
@@ -61,8 +65,85 @@ struct fifo_device
     unsigned int pcm_bps;
     unsigned int running;
 
+	unsigned int irq_pos;
+	unsigned int period_size_frac;
+	unsigned long last_jiffies;
+	struct timer_list timer;
+
     struct snd_pcm_substream *substream;
 };
+
+// ==================================== TEMPORARY =====================================
+static void fifo_timer_start(struct fifo_device *dev)
+{
+	unsigned long tick;
+	tick = dev->period_size_frac - dev->irq_pos;
+	tick = (tick + dev->pcm_bps - 1) / dev->pcm_bps;
+	dev->timer.expires = jiffies + tick;
+	add_timer(&dev->timer);
+}
+
+static void fifo_timer_stop(struct fifo_device *dev)
+{
+	del_timer(&dev->timer);
+}
+
+static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct loopback_pcm *dpcm = runtime->private_data;
+	struct fifo_device *dev = dpcm->cable;
+	switch (cmd)
+	{
+		case SNDRV_PCM_TRIGGER_START:
+			if (!dev->running)
+			{
+				dev->last_jiffies = jiffies;
+				loopback_timer_start(dev);
+			}
+			dev->running |= (1 << substream->stream);
+			break;
+		case SNDRV_PCM_TRIGGER_STOP:
+			dev->running &= ~(1 << substream->stream);
+			if (!dev->running)
+				loopback_timer_stop(dev);
+			break;
+		default:
+			return -EINVAL;
+	}
+	return 0;
+}
+
+/*
+ * TODO rewrite this to copy on a file instead that on another pcm device, follow calls
+ * to required playback ops
+ */
+static void copy_play_buf(struct loopback_pcm *play,
+						  struct loopback_pcm *capt,
+						  unsigned int bytes)
+{
+	char *src = play->substream->runtime->dma_area;
+	char *dst = capt->substream->runtime->dma_area;
+	unsigned int src_off = play->buf_pos;
+	unsigned int dst_off = capt->buf_pos;
+	for (;;) {
+		unsigned int size = bytes;
+		if (src_off + size > play->pcm_buffer_size)
+			size = play->pcm_buffer_size - src_off;
+		if (dst_off + size > capt->pcm_buffer_size)
+			size = capt->pcm_buffer_size - dst_off;
+		memcpy(dst + dst_off, src + src_off, size);
+		if (size < capt->silent_size)
+			capt->silent_size -= size;
+		else
+			capt->silent_size = 0;
+		bytes -= size;
+		if (!bytes)
+			break;
+		src_off = (src_off + size) % play->pcm_buffer_size;
+		dst_off = (dst_off + size) % capt->pcm_buffer_size;
+	}
+}
 
 // ============================ FUNCTION DECLARATIONS =================================
 // alsa functions
