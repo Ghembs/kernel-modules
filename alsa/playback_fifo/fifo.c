@@ -41,6 +41,7 @@ MODULE_SUPPORTED_DEVICE("{{ALSA, FIFO PLAYBACK}}");
 
 #define byte_pos(x)	((x) / HZ)
 #define frac_pos(x)	((x) * HZ)
+#define MAX_PCM_SUBSTREAMS	8
 
 /**
  * TODO check aloop.c to create a stream from playback to a fifo, through the corresponding
@@ -54,46 +55,60 @@ static int enable[SNDRV_CARDS] = {1, [1 ... (SNDRV_CARDS - 1)] = 0};
 
 static struct platform_device *devices[SNDRV_CARDS];
 
-struct fifo_device
-{
-    struct mutex cable_lock;
+struct fifo_pcm;
 
-    // PCM stuff
-	unsigned int pcm_buffer_size;
+struct fifo_cable
+{
+	struct fifo_pcm *stream;
+
+	struct snd_pcm_hardware hw;
 	unsigned int pcm_period_size;
-    unsigned int buf_pos;
-    unsigned int pcm_bps;
-	unsigned int silent_size;
+	unsigned int pcm_bps;
 
 	// flags
 	unsigned int valid;
 	unsigned int period_update_pending :1;
-    unsigned int running;
+	unsigned int running;
 
-    //timer
+	//timer
 	unsigned int irq_pos;
 	unsigned int period_size_frac;
 	unsigned long last_jiffies;
 	struct timer_list timer;
+};
+
+struct fifo_device
+{
+	struct fifo_cable *cable[MAX_PCM_SUBSTREAMS];
+	struct mutex cable_lock;
 
 	// alsa structs
 	struct snd_card *card;
 	struct snd_pcm *pcm;
-    struct snd_pcm_substream *substream;
-	struct snd_pcm_hardware hw;
+};
+
+struct fifo_pcm
+{
+	struct fifo_device *fifo;
+	struct fifo_cable *cable;
+
+	struct snd_pcm_substream *substream;
+	unsigned int pcm_buffer_size;
+	unsigned int buf_pos;
+	unsigned int silent_size;
 };
 
 // ==================================== TEMPORARY =====================================
-static void fifo_timer_start(struct fifo_device *dev)
+static void fifo_timer_start(struct fifo_cable *cable)
 {
 	unsigned long tick;
-	tick = dev->period_size_frac - dev->irq_pos;
-	tick = (tick + dev->pcm_bps - 1) / dev->pcm_bps;
-	dev->timer.expires = jiffies + tick;
-	add_timer(&dev->timer);
+	tick = cable->period_size_frac - cable->irq_pos;
+	tick = (tick + cable->pcm_bps - 1) / cable->pcm_bps;
+	cable->timer.expires = jiffies + tick;
+	add_timer(&cable->timer);
 }
 
-static void fifo_timer_stop(struct fifo_device *dev)
+static void fifo_timer_stop(struct fifo_cable *dev)
 {
 	del_timer(&dev->timer);
 }
@@ -102,7 +117,7 @@ static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	//struct loopback_pcm *dpcm = runtime->private_data;
-	struct fifo_device *dev = runtime->private_data; // dpcm->cable;
+	struct fifo_cable *dev = runtime->private_data; // dpcm->cable;
 	switch (cmd)
 	{
 		case SNDRV_PCM_TRIGGER_START:
@@ -128,11 +143,10 @@ static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
  * TODO rewrite this to copy on a file instead that on another pcm device, follow calls
  * to required playback ops
  */
-static void copy_play_buf(struct fifo_device *play,
-						  struct fifo_device *capt,
+static void copy_play_buf(struct fifo_pcm *play,
+						  struct fifo_pcm *capt,
 						  unsigned int bytes)
 {
-	mknod("/tmp/prova");
 	char *src = play->substream->runtime->dma_area;
 	char *dst = capt->substream->runtime->dma_area;
 	unsigned int src_off = play->buf_pos;
@@ -160,7 +174,8 @@ static int fifo_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	//struct loopback_pcm *dpcm = runtime->private_data;
-	struct fifo_device *dev = runtime->private_data; // dpcm->cable;
+	struct fifo_pcm *dev = runtime->private_data; // dpcm->cable;
+	struct fifo_cable *cable = dev->cable;
 	unsigned int bps;
 	bps = runtime->rate * runtime->channels;
 	bps *= snd_pcm_format_width(runtime->format);
@@ -174,30 +189,30 @@ static int fifo_prepare(struct snd_pcm_substream *substream)
 		dev->silent_size = dev->pcm_buffer_size;
 		memset(runtime->dma_area, 0, dev->pcm_buffer_size);
 	}
-	if (!dev->running) {
-		dev->irq_pos = 0;
-		dev->period_update_pending = 0;
+	if (!cable->running) {
+		cable->irq_pos = 0;
+		cable->period_update_pending = 0;
 	}
-	mutex_lock(&dev->cable_lock);
-	if (!(dev->valid & ~(1 << substream->stream))) {
-		dev->pcm_bps = bps;
-		dev->pcm_period_size =
+	mutex_lock(&dev->fifo->cable_lock);
+	if (!(cable->valid & ~(1 << substream->stream))) {
+		cable->pcm_bps = bps;
+		cable->pcm_period_size =
 				frames_to_bytes(runtime, runtime->period_size);
-		dev->period_size_frac = frac_pos(dev->pcm_period_size);
-		dev->hw.formats = (1ULL << runtime->format);
-		dev->hw.rate_min = runtime->rate;
-		dev->hw.rate_max = runtime->rate;
-		dev->hw.channels_min = runtime->channels;
-		dev->hw.channels_max = runtime->channels;
-		dev->hw.period_bytes_min = dev->pcm_period_size;
-		dev->hw.period_bytes_max = dev->pcm_period_size;
+		cable->period_size_frac = frac_pos(cable->pcm_period_size);
+		cable->hw.formats = (1ULL << runtime->format);
+		cable->hw.rate_min = runtime->rate;
+		cable->hw.rate_max = runtime->rate;
+		cable->hw.channels_min = runtime->channels;
+		cable->hw.channels_max = runtime->channels;
+		cable->hw.period_bytes_min = cable->pcm_period_size;
+		cable->hw.period_bytes_max = cable->pcm_period_size;
 	}
-	dev->valid |= 1 << substream->stream;
-	mutex_unlock(&dev->cable_lock);
+	cable->valid |= 1 << substream->stream;
+	mutex_unlock(&dev->fifo->cable_lock);
 	return 0;
 }
 
-static void fifo_xfer_buf(struct fifo_device *dev, unsigned int count)
+static void fifo_xfer_buf(struct fifo_cable *dev, unsigned int count)
 {
 	int i;
 	/*switch (dev->running) {
@@ -211,18 +226,19 @@ static void fifo_xfer_buf(struct fifo_device *dev, unsigned int count)
 						  count);
 			break;
 	}*/
-	copy_play_buf(dev,
-				  dev,
+	copy_play_buf(dev->stream,
+				  dev->stream,
 				  count);
 	for (i = 0; i < 2; i++) {
 		if (dev->running & (1 << i)) {
-			dev->buf_pos += count;
-			dev->buf_pos %= dev->pcm_buffer_size;
+			struct fifo_pcm *pcm = dev->stream;
+			pcm->buf_pos += count;
+			pcm->buf_pos %= pcm->pcm_buffer_size;
 		}
 	}
 }
 
-static void fifo_pos_update(struct fifo_device *cable)
+static void fifo_pos_update(struct fifo_cable *cable)
 {
 	unsigned int last_pos, count;
 	unsigned long delta;
@@ -237,7 +253,7 @@ static void fifo_pos_update(struct fifo_device *cable)
 	count = byte_pos(cable->irq_pos) - last_pos;
 	if (!count)
 		return;
-	loopback_xfer_buf(cable, count);
+	fifo_xfer_buf(cable, count);
 	if (cable->irq_pos >= cable->period_size_frac) {
 		cable->irq_pos %= cable->period_size_frac;
 		cable->period_update_pending = 1;
@@ -246,18 +262,18 @@ static void fifo_pos_update(struct fifo_device *cable)
 
 static void fifo_timer_function(unsigned long data)
 {
-	struct fifo_device *cable = (struct fifo_device *)data;
+	struct fifo_cable *cable = (struct fifo_cable *)data;
 	int i;
 	if (!cable->running)
 		return;
-	loopback_pos_update(cable);
-	loopback_timer_start(cable);
+	fifo_pos_update(cable);
+	fifo_timer_start(cable);
 	if (cable->period_update_pending) {
 		cable->period_update_pending = 0;
 		for (i = 0; i < 2; i++) {
 			if (cable->running & (1 << i)) {
-				// struct loopback_pcm *dpcm = cable->streams[i];
-				snd_pcm_period_elapsed(cable->substream);
+				struct fifo_pcm *dpcm = cable->stream;
+				snd_pcm_period_elapsed(dpcm->substream);
 			}
 		}
 	}
@@ -266,8 +282,8 @@ static void fifo_timer_function(unsigned long data)
 static snd_pcm_uframes_t fifo_pointer(struct snd_pcm_substream *substream)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct fifo_device *dpcm = runtime->private_data;
-	loopback_pos_update(dpcm->cable);
+	struct fifo_pcm *dpcm = runtime->private_data;
+	fifo_pos_update(dpcm->cable);
 	return bytes_to_frames(runtime, dpcm->buf_pos);
 }
 
@@ -398,6 +414,7 @@ static int fifo_hw_free(struct snd_pcm_substream *ss)
 
 static int fifo_pcm_open(struct snd_pcm_substream *ss)
 {
+	struct fifo_pcm *dpcm;
 	struct fifo_device *mydev = ss->private_data;
     printk(KERN_WARNING "opening this beautiful useless device");
 
@@ -405,7 +422,7 @@ static int fifo_pcm_open(struct snd_pcm_substream *ss)
 
 	ss->runtime->hw = fifo_pcm_hw;
 
-    mydev->substream = ss;
+    dpcm->substream = ss;
 
 	ss->runtime->private_data = mydev;
 
@@ -432,7 +449,7 @@ static int fifo_pcm_close(struct snd_pcm_substream *ss)
 static int fifo_pcm_prepare(struct snd_pcm_substream *ss)
 {
 	struct snd_pcm_runtime *runtime = ss->runtime;
-	struct fifo_device *mydev = runtime->private_data;
+	struct fifo_pcm *mydev = runtime->private_data;
 	unsigned int bps;
 
     printk(KERN_WARNING "PREPARE");
