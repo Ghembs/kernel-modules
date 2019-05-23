@@ -22,14 +22,32 @@
 
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/version.h>
+#include <linux/kernel.h>
+#include <linux/moduleparam.h>
+#include <linux/firmware.h>
+#include <linux/netdevice.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/ioctl.h>
+#include <linux/io.h>
+#include <linux/miscdevice.h>
+#include <linux/slab.h>
+
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/pcm.h>
+
 #include <linux/mmc/sdio_func.h>
+#include <linux/mmc/sdio_ids.h>
 #include <linux/mmc/card.h>
 #include <linux/mmc/core.h>
 #include <linux/mmc/host.h>
-#include <linux/version.h>
+#include <linux/ssb/ssb.h>
+
+#include "sdio_playback.h"
 
 MODULE_AUTHOR("Giuliano Gambacorta");
 MODULE_DESCRIPTION("SDIO sound card");
@@ -40,9 +58,52 @@ MODULE_SUPPORTED_DEVICE("{{ALSA, SDIO FPGA}}");
 #define MAX_BUFFER (32 * 48) // depending on period_bytes* and periods_max
 #define SND_SDIO_DRIVER	"snd_sdio"
 
+// ============================ SDIO func definition =================================
+static int sdio_open(struct inode *inode, struct file *file);
+static ssize_t sdio_write(struct file *file, const char __user *buf, size_t count,
+        loff_t *pos);
+static ssize_t sdio_read(struct file *file, char __user *buf, size_t count,
+        loff_t *pos);
+static long sdio_ioctl(	struct file *file,
+                           unsigned int cmd,  	// cmd is command
+                           unsigned long arg);
+
+static int __probe(struct sdio_func *func);
+static int sdio_probe(struct sdio_func *func, const struct sdio_device_id *id)
+static void __remove(struct sdio_func *func);
+
+// =========================== ALSA func definition ==================================
+static int sdio_hw_params(struct snd_pcm_substream *ss,
+                          struct snd_pcm_hw_params *hw_params);
+static int sdio_hw_free(struct snd_pcm_substream *ss);
+static int sdio_pcm_open(struct snd_pcm_substream *ss);
+static int sdio_pcm_close(struct snd_pcm_substream *ss);
+static int sdio_pcm_prepare(struct snd_pcm_substream *ss);
+static int sdio_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
+static snd_pcm_uframes_t sdio_pcm_pointer(struct snd_pcm_substream *ss);
+
+
 static const struct sdio_device_id sdio_ids[] = {
         { SDIO_DEVICE(0x0213, 0x1002) },
         { },
+};
+
+static int 	major = SDIO_MAJOR;
+static int  BlockAddress, isExit, isResume;
+u8			*kbuf;//[MAX_SDIO_BYTES];		// kmalloc works, u8 not working
+static int SampleRate, SampleBits;
+static struct task_struct *tsk;
+static LIST_HEAD(sdio_card_list);
+
+struct sdio_card {
+    struct sdio_func	*func;
+
+    struct list_head 	list;
+    unsigned int 		major;
+
+    unsigned long 		ioport;
+    struct cdev 		cdev;
+    dev_t 				devid;
 };
 
 // =========================== REQUIRED ALSA STRUCTS ==================================
@@ -54,15 +115,17 @@ static struct snd_pcm_hardware sdio_pcm_playback_hw =
              SNDRV_PCM_INFO_INTERLEAVED |
              SNDRV_PCM_INFO_BLOCK_TRANSFER |
              SNDRV_PCM_INFO_MMAP_VALID),
-    .formats          = SNDRV_PCM_FMTBIT_S32_LE,
-    .rates            = SNDRV_PCM_RATE_8000_192000,
+    .formats = (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S16_BE |
+                SNDRV_PCM_FMTBIT_S32_LE | SNDRV_PCM_FMTBIT_S32_BE |
+                SNDRV_PCM_FMTBIT_FLOAT_LE | SNDRV_PCM_FMTBIT_FLOAT_BE),
+    .rates            = SNDRV_PCM_RATE_CONTINUOUS | SNDRV_PCM_RATE_8000_192000,
     .rate_min         = 8000,
     .rate_max         = 192000,
-    .channels_min     = 2,
+    .channels_min     = 1,
     .channels_max     = 2,
-    .buffer_bytes_max = MAX_BUFFER, //(32 * 48) = 1536,
-    .period_bytes_min = 48,
-    .period_bytes_max = 48,
+    .buffer_bytes_max = 2 * 1024 * 1024, //(32 * 48) = 1536,
+    .period_bytes_min = 64,
+    .period_bytes_max = 2 * 1024 * 1024,
     .periods_min      = 1,
     .periods_max      = 1024,
 };
@@ -81,6 +144,17 @@ static struct snd_pcm_ops sdio_pcm_ops =
     .prepare   = sdio_pcm_prepare,
     .trigger   = sdio_pcm_trigger,
     .pointer   = sdio_pcm_pointer,
+};
+
+static const struct file_operations fops_test = {
+        .open			= sdio_open,
+        .read			= sdio_read,
+        .write			= sdio_write,
+#ifndef CONFIG_COMPAT	// this for 64bit kernel 32bit rootfs
+        .unlocked_ioctl = sdio_ioctl
+#else
+        .compat_ioctl	= sdio_ioctl
+#endif
 };
 
 static struct sdio_driver sdio_driver =
@@ -104,49 +178,6 @@ static struct sdio_driver sdio_driver =
 };
 
 // ====================================================================================
-
-// TODO remove elements from timer or sample sound array
-struct sdio_card {
-    struct sdio_func	*func;
-
-    struct list_head 	list;
-    unsigned int 		major;
-
-    unsigned long 		ioport;
-    struct cdev 		cdev;
-    dev_t 				devid;
-
-    struct snd_card *card;
-    struct snd_pcm *pcm;
-    const struct sdio_pcm_ops *timer_ops;
-    /*
-    * we have only one substream, so all data in this struct
-    */
-    /* copied from struct loopback: */
-    struct mutex cable_lock;
-    /* copied from struct loopback_cable: */
-    /* PCM parameters */
-    unsigned int pcm_period_size;
-    unsigned int pcm_bps;		/* bytes per second */
-    /* flags */
-    unsigned int valid;
-    unsigned int running;
-    unsigned int period_update_pending :1;
-    /* timer stuff */
-    unsigned int irq_pos;		/* fractional IRQ position */
-    unsigned int period_size_frac;
-    // unsigned long last_jiffies; // not needed 'cause real hw
-    struct timer_list timer;
-    /* copied from struct loopback_pcm: */
-    struct snd_pcm_substream *substream;
-    unsigned int pcm_buffer_size;
-    unsigned int buf_pos;	/* position in buffer */
-    unsigned int silent_size;
-    /* added for waveform: */
-    unsigned int wvf_pos;	/* position in waveform array */
-    unsigned int wvf_lift;	/* lift of waveform array */
-
-};
 
 // TODO add alsa stuff
 static int __init sdio_alsa_init_module(void)
