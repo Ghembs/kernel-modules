@@ -1,11 +1,12 @@
-TARGET_MODULE:=memory
+TARGET_MODULE:=kernel-encoding
 
-obj-m := memory.o
+obj-m += kernel-encoding.o
 
+$(TARGET_MODULE)-objs  := kernel_encoding.o
 BUILDSYSTEM_DIR:=/lib/modules/$(shell uname -r)/build
 PWD:=$(shell pwd)
 
-all:
+all :
 	$(MAKE) -C $(BUILDSYSTEM_DIR) M=$(PWD) modules
 clean:
 	$(MAKE) -C $(BUILDSYSTEM_DIR) M=$(PWD) clean

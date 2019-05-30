@@ -17,7 +17,7 @@ MODULE_LICENSE("Dual BSD/GPL");
 static int memory_open(struct inode *inode, struct file *filp);
 static int memory_release(struct inode *inode, struct file *filp);
 static ssize_t memory_read(struct file *filp, char *buf, size_t count, loff_t *f_pos);
-static ssize_t memory_write(struct file *filp, char *buf, size_t count, loff_t *f_pos);
+static ssize_t memory_write(struct file *filp, const char *buf, size_t count, loff_t *f_pos);
 
 void memory_exit(void);
 int memory_init(void);
@@ -108,7 +108,7 @@ static ssize_t memory_read(struct file *filp, char *buf, size_t count, loff_t *f
     }
 }
 
-static ssize_t memory_write(struct file *filp, char *buf, size_t count, loff_t *f_pos)
+static ssize_t memory_write(struct file *filp, const char *buf, size_t count, loff_t *f_pos)
 {
     char *tmp;
 
