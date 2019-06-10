@@ -59,51 +59,36 @@ static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;	/* Index 0-MAX */
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;	/* ID for this card */
 static int enable[SNDRV_CARDS] = {1, [1 ... (SNDRV_CARDS - 1)] = 0};
 
-static struct platform_device *devices[SNDRV_CARDS];
+static struct platform_device *device;
 
-struct fifo_pcm;
-
-struct fifo_cable
+struct fifo_snd_device
 {
-	struct fifo_pcm *stream;
-
-	struct snd_pcm_hardware hw;
-	unsigned int pcm_period_size;
-	unsigned int pcm_bps;
-
-	// flags
-	unsigned int valid;
-	unsigned int period_update_pending :1;
-	unsigned int running;
-
-	//timer
-	unsigned int irq_pos;
-	unsigned int period_size_frac;
-	unsigned long last_jiffies;
-	struct timer_list timer;
+    struct snd_card *card;
+    struct snd_pcm *pcm;
+    const struct sdio_pcm_ops *timer_ops;
+    /* copied from struct loopback: */
+    struct mutex cable_lock;
+    /* copied from struct loopback_cable: */
+    /* PCM parameters */
+    unsigned int pcm_period_size;
+    unsigned int pcm_bps;		/* bytes per second */
+    /* flags */
+    unsigned int valid;
+    unsigned int running;
+    unsigned int period_update_pending :1;
+    /* timer stuff */
+    unsigned int irq_pos;		/* fractional IRQ position */
+    unsigned int period_size_frac;
+    unsigned long last_jiffies;
+    struct timer_list timer;
+    /* copied from struct loopback_pcm: */
+    struct snd_pcm_substream *substream;
+    unsigned int pcm_buffer_size;
+    unsigned int buf_pos;	/* position in buffer */
+    unsigned int silent_size;
+    struct sdio_card *sdio;
+    /* added for waveform: */
 };
-
-struct fifo_device
-{
-	struct fifo_cable *cable[MAX_PCM_SUBSTREAMS];
-	struct mutex cable_lock;
-
-	// alsa structs
-	struct snd_card *card;
-	struct snd_pcm *pcm;
-};
-
-struct fifo_pcm
-{
-	struct fifo_device *fifo;
-	struct fifo_cable *cable;
-
-	struct snd_pcm_substream *substream;
-	unsigned int pcm_buffer_size;
-	unsigned int buf_pos;
-	unsigned int silent_size;
-};
-
 
 static const char   g_s_Hello_World_string[] = "Hello, world, from kernel mode!\n\0";
 static const ssize_t g_s_Hello_World_size = sizeof(g_s_Hello_World_string);
@@ -134,42 +119,24 @@ static struct file_operations simple_driver_fops = {
 };
 
 // ==================================== TEMPORARY =====================================
-static void fifo_timer_start(struct fifo_cable *cable)
-{
-    printk(KERN_WARNING "fifo_timer_start");
-	unsigned long tick;
-	tick = cable->period_size_frac - cable->irq_pos;
-	tick = (tick + cable->pcm_bps - 1) / cable->pcm_bps;
-	cable->timer.expires = jiffies + tick;
-	add_timer(&cable->timer);
-}
-
-static void fifo_timer_stop(struct fifo_cable *dev)
-{
-    printk(KERN_WARNING "fifo_timer_stop");
-	del_timer(&dev->timer);
-}
-
 static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
 {
     printk(KERN_WARNING "fifo_trigger");
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	//struct loopback_pcm *dpcm = runtime->private_data;
-	struct fifo_cable *dev = runtime->private_data; // dpcm->cable;
+	struct fifo_snd_device *dev = substream->private_data;
 	switch (cmd)
 	{
 		case SNDRV_PCM_TRIGGER_START:
 			if (!dev->running)
 			{
 				dev->last_jiffies = jiffies;
-				fifo_timer_start(dev);
+				//fifo_timer_start(dev);
 			}
 			dev->running |= (1 << substream->stream);
 			break;
 		case SNDRV_PCM_TRIGGER_STOP:
 			dev->running &= ~(1 << substream->stream);
 			if (!dev->running)
-				fifo_timer_stop(dev);
+				//fifo_timer_stop(dev);
 			break;
 		default:
 			return -EINVAL;
@@ -181,123 +148,64 @@ static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
  * TODO rewrite this to copy on a file instead that on another pcm device, follow calls
  * to required playback ops
  */
-static void copy_play_buf(struct fifo_pcm *play,
-						  //struct fifo_pcm *capt,
+static void copy_play_buf(struct fifo_snd_device *play,
 						  unsigned int bytes)
 {
     printk(KERN_WARNING "copy_play_buf");
 	char *src = play->substream->runtime->dma_area;
-	//char *dst = capt->substream->runtime->dma_area;
+
 	unsigned int src_off = play->buf_pos;
-	//unsigned int dst_off = capt->buf_pos;
+
 	for (;;) {
 		unsigned int size = bytes;
 		if (src_off + size > play->pcm_buffer_size)
 			size = play->pcm_buffer_size - src_off;
-		/*if (dst_off + size > capt->pcm_buffer_size)
-			size = capt->pcm_buffer_size - dst_off;
-		memcpy(dst + dst_off, src + src_off, size);
-		if (size < capt->silent_size)
-			capt->silent_size -= size;
-		else
-			capt->silent_size = 0;
-		bytes -= size;
-		if (!bytes)
-			break;*/
+
         memcpy(g_s_Hello_World_string, src + src_off, size);
-		src_off = (src_off + size) % play->pcm_buffer_size;
+
+        bytes -= size;
         if (!bytes)
             break;
-		//dst_off = (dst_off + size) % capt->pcm_buffer_size;
+
+        src_off = (src_off + size) % play->pcm_buffer_size;
 	}
 }
 
-static int fifo_prepare(struct snd_pcm_substream *substream)
-{
-    printk(KERN_WARNING "fifo_prepare");
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	//struct loopback_pcm *dpcm = runtime->private_data;
-	struct fifo_pcm *dev = runtime->private_data; // dpcm->cable;
-	struct fifo_cable *cable = dev->cable;
-	unsigned int bps;
-	bps = runtime->rate * runtime->channels;
-	bps *= snd_pcm_format_width(runtime->format);
-	bps /= 8;
-	if (bps <= 0)
-		return -EINVAL;
-	dev->buf_pos = 0;
-	dev->pcm_buffer_size = frames_to_bytes(runtime, runtime->buffer_size);
-	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
-		/* clear capture buffer */
-		dev->silent_size = dev->pcm_buffer_size;
-		memset(runtime->dma_area, 0, dev->pcm_buffer_size);
-	}
-	if (!cable->running) {
-		cable->irq_pos = 0;
-		cable->period_update_pending = 0;
-	}
-	mutex_lock(&dev->fifo->cable_lock);
-	if (!(cable->valid & ~(1 << substream->stream))) {
-		cable->pcm_bps = bps;
-		cable->pcm_period_size =
-				frames_to_bytes(runtime, runtime->period_size);
-		cable->period_size_frac = frac_pos(cable->pcm_period_size);
-		cable->hw.formats = (1ULL << runtime->format);
-		cable->hw.rate_min = runtime->rate;
-		cable->hw.rate_max = runtime->rate;
-		cable->hw.channels_min = runtime->channels;
-		cable->hw.channels_max = runtime->channels;
-		cable->hw.period_bytes_min = cable->pcm_period_size;
-		cable->hw.period_bytes_max = cable->pcm_period_size;
-	}
-	cable->valid |= 1 << substream->stream;
-	mutex_unlock(&dev->fifo->cable_lock);
-	return 0;
-}
-
-static void fifo_xfer_buf(struct fifo_cable *dev, unsigned int count)
+static void fifo_xfer_buf(struct fifo_snd_device *dev, unsigned int count)
 {
 	int i;
     printk(KERN_WARNING "fifo_xfer_buf");
-	/*switch (dev->running) {
-		case CABLE_CAPTURE:
-			clear_capture_buf(dev->streams[SNDRV_PCM_STREAM_CAPTURE],
-							  count);
-			break;
-		case CABLE_BOTH:
-			copy_play_buf(dev->streams[SNDRV_PCM_STREAM_PLAYBACK],
-						  dev->streams[SNDRV_PCM_STREAM_CAPTURE],
-						  count);
-			break;
-	}*/
-	copy_play_buf(dev->stream,
-				  //dev->stream,
+
+	copy_play_buf(dev,
 				  count);
 	for (i = 0; i < 2; i++) {
 		if (dev->running & (1 << i)) {
-			struct fifo_pcm *pcm = dev->stream;
-			pcm->buf_pos += count;
-			pcm->buf_pos %= pcm->pcm_buffer_size;
+			dev->buf_pos += count;
+			dev->buf_pos %= dev->pcm_buffer_size;
 		}
 	}
 }
 
-static void fifo_pos_update(struct fifo_cable *cable)
+static void fifo_pos_update(struct fifo_snd_device *cable)
 {
     printk(KERN_WARNING "fifo_pos_update");
 	unsigned int last_pos, count;
 	unsigned long delta;
+
 	if (!cable->running)
 		return;
+
 	delta = jiffies - cable->last_jiffies;
 	if (!delta)
 		return;
+
 	cable->last_jiffies += delta;
 	last_pos = byte_pos(cable->irq_pos);
 	cable->irq_pos += delta * cable->pcm_bps;
 	count = byte_pos(cable->irq_pos) - last_pos;
 	if (!count)
 		return;
+
 	fifo_xfer_buf(cable, count);
 	if (cable->irq_pos >= cable->period_size_frac) {
 		cable->irq_pos %= cable->period_size_frac;
@@ -305,35 +213,14 @@ static void fifo_pos_update(struct fifo_cable *cable)
 	}
 }
 
-static void fifo_timer_function(unsigned long data)
-{
-    printk(KERN_WARNING "fifo_timer_function");
-	struct fifo_cable *cable = (struct fifo_cable *)data;
-	int i;
-	if (!cable->running)
-		return;
-	fifo_pos_update(cable);
-	fifo_timer_start(cable);
-	if (cable->period_update_pending) {
-		cable->period_update_pending = 0;
-		for (i = 0; i < 2; i++) {
-			if (cable->running & (1 << i)) {
-				struct fifo_pcm *dpcm = cable->stream;
-				snd_pcm_period_elapsed(dpcm->substream);
-			}
-		}
-	}
-}
-
 static snd_pcm_uframes_t fifo_pointer(struct snd_pcm_substream *substream)
 {
     printk(KERN_WARNING "fifo_pointer");
 	struct snd_pcm_runtime *runtime = substream->runtime;
-	struct fifo_pcm *dpcm = runtime->private_data;
-	fifo_pos_update(dpcm->cable);
+	struct fifo_snd_device *dpcm = runtime->private_data;
+	fifo_pos_update(dpcm);
 	return bytes_to_frames(runtime, dpcm->buf_pos);
 }
-
 // ============================ FUNCTION DECLARATIONS =================================
 // alsa functions
 static int fifo_hw_params(struct snd_pcm_substream *ss,
@@ -342,11 +229,9 @@ static int fifo_hw_free(struct snd_pcm_substream *ss);
 static int fifo_pcm_open(struct snd_pcm_substream *ss);
 static int fifo_pcm_close(struct snd_pcm_substream *ss);
 static int fifo_pcm_prepare(struct snd_pcm_substream *ss);
-static int fifo_pcm_trigger(struct snd_pcm_substream *substream, int cmd);
-static snd_pcm_uframes_t fifo_pcm_pointer(struct snd_pcm_substream *ss);
 
 static int fifo_pcm_dev_free(struct snd_device *device);
-static int fifo_pcm_free(struct fifo_device *chip);
+static int fifo_pcm_free(struct fifo_snd_device *chip);
 
 //static void fifo_pos_update(struct fifo_device *mydev);
 
@@ -414,39 +299,6 @@ static struct platform_driver fifo_driver =
 };
 
 // ======================= PCM PLAYBACK OPERATIONS ====================================
-static int fifo_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
-{
-	int ret = 0;
-	struct fifo_device *mydev = substream->private_data;
-	printk(KERN_WARNING "fifo_pcm_trigger");
-
-	switch (cmd)
-	{
-		case SNDRV_PCM_TRIGGER_START:
-			printk(KERN_WARNING "starting this beautiful useless device");
-			break;
-		case SNDRV_PCM_TRIGGER_STOP:
-			printk(KERN_WARNING "stopping this beautiful useless device");
-			break;
-		default:
-			ret = -EINVAL;
-	}
-    return ret;
-}
-
-static snd_pcm_uframes_t fifo_pcm_pointer(struct snd_pcm_substream *ss)
-{
-    struct snd_pcm_runtime *runtime = ss->runtime;
-    struct fifo_device *mydev = runtime->private_data;
-
-	printk(KERN_WARNING "fifo_pcm_pointer");
-
-    //fifo_pos_update(mydev);
-
-    //return bytes_to_frames(runtime, mydev->buf_pos);
-    return runtime->buffer_size;
-}
-
 static int fifo_hw_params(struct snd_pcm_substream *ss,
                         struct snd_pcm_hw_params *hw_params)
 {
@@ -463,15 +315,14 @@ static int fifo_hw_free(struct snd_pcm_substream *ss)
 
 static int fifo_pcm_open(struct snd_pcm_substream *ss)
 {
-	struct fifo_pcm *dpcm;
-	struct fifo_device *mydev = ss->private_data;
+	struct fifo_snd_device *mydev = ss->private_data;
     printk(KERN_WARNING "fifo_pcm_open");
 
     mutex_lock(&mydev->cable_lock);
 
 	ss->runtime->hw = fifo_pcm_hw;
 
-    dpcm->substream = ss;
+    mydev->substream = ss;
 
 	ss->runtime->private_data = mydev;
 
@@ -482,7 +333,7 @@ static int fifo_pcm_open(struct snd_pcm_substream *ss)
 
 static int fifo_pcm_close(struct snd_pcm_substream *ss)
 {
-    struct fifo_device *mydev = ss->private_data;
+    struct fifo_snd_device *mydev = ss->private_data;
     printk(KERN_WARNING "fifo_pcm_close");
 
     mutex_lock(&mydev->cable_lock);
@@ -498,7 +349,7 @@ static int fifo_pcm_close(struct snd_pcm_substream *ss)
 static int fifo_pcm_prepare(struct snd_pcm_substream *ss)
 {
 	struct snd_pcm_runtime *runtime = ss->runtime;
-	struct fifo_pcm *mydev = runtime->private_data;
+	struct fifo_snd_device *mydev = runtime->private_data;
 	unsigned int bps;
 
     printk(KERN_WARNING "fifo_pcm_prepare");
@@ -512,14 +363,26 @@ static int fifo_pcm_prepare(struct snd_pcm_substream *ss)
 		return -EINVAL;
 
 	mydev->pcm_buffer_size = frames_to_bytes(runtime, runtime->buffer_size);
-	if (ss->stream == SNDRV_PCM_STREAM_CAPTURE) {
-		memset(runtime->dma_area, 45, mydev->pcm_buffer_size);
-	}
+    if (!mydev->running) {
+        mydev->irq_pos = 0;
+        mydev->period_update_pending = 0;
+    }
+
+    mutex_lock(&mydev->cable_lock);
+    if (!(mydev->valid & ~(1 << ss->stream))) {
+        mydev->pcm_bps = bps;
+        mydev->pcm_period_size =
+                frames_to_bytes(runtime, runtime->period_size);
+        mydev->period_size_frac = frac_pos(mydev->pcm_period_size);
+    }
+
+    mydev->valid |= 1 << ss->stream;
+    mutex_unlock(&mydev->cable_lock);
 
 	return 0;
 }
 
-static int fifo_pcm_free(struct fifo_device *chip)
+static int fifo_pcm_free(struct fifo_snd_device *chip)
 {
     printk(KERN_WARNING "fifo_pcm_free");
 	return 0;
@@ -535,7 +398,7 @@ static int fifo_probe(struct platform_device *devptr)
 {
 	struct snd_card *card;
 	struct snd_pcm *pcm;
-	struct fifo_device *mydev;
+	struct fifo_snd_device *mydev;
 	int dev = devptr->id;
 
 	int ret;
@@ -546,9 +409,9 @@ static int fifo_probe(struct platform_device *devptr)
 
 	// sound card creation
 	ret = snd_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
-					   sizeof(struct fifo_device), &card);
+					   sizeof(struct fifo_snd_device), &card);
 
-    printk(KERN_WARNING "NU SOUNDCARD");
+    printk(KERN_WARNING "New soundcard");
 	if (ret < 0)
 		goto __nodev;
 
@@ -576,7 +439,7 @@ static int fifo_probe(struct platform_device *devptr)
 	snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &fifo_pcm_playback_ops);
 	pcm->private_data = mydev;
 
-    printk(KERN_WARNING "NU DEVICE");
+    printk(KERN_WARNING "New device");
 
 	pcm->info_flags = 0;
 
@@ -601,7 +464,7 @@ static int fifo_probe(struct platform_device *devptr)
 
     if (result < 0)
     {
-        printk(KERN_WARNING "Simple-driver: can\'t register character device with errorcode = %i", result);
+        printk(KERN_WARNING "Fifo-soundcard: can\'t register character device with errorcode = %i", result);
         return result;
     }
 
@@ -612,7 +475,6 @@ static int fifo_probe(struct platform_device *devptr)
 	}
 
 __nodev: // as in aloop/dummy...
-    printk(KERN_WARNING "KILLING NAZIS ON THE MOON");
 	snd_card_free(card); // this will autocall .dev_free (= fifo_pcm_dev_free)
 	return ret;
 }
@@ -629,8 +491,7 @@ static void fifo_unregister_all(void)
 {
     int i;
 
-    for (i = 0; i < ARRAY_SIZE(devices); ++i)
-        platform_device_unregister(devices[i]);
+    platform_device_unregister(device);
 
     platform_driver_unregister(&fifo_driver);
 }
@@ -648,7 +509,7 @@ static int __init alsa_card_fifo_init(void)
 
 	for (i = 0; i < SNDRV_CARDS; i++)
 	{
-		struct platform_device *device;
+		//struct platform_device *device;
 
 		if (!enable[i])
 			continue;
@@ -664,7 +525,7 @@ static int __init alsa_card_fifo_init(void)
 			continue;
 		}
 
-		devices[i] = device;
+		//device = device;
 		cards++;
 	}
 
