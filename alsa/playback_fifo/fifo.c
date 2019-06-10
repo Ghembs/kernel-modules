@@ -32,6 +32,12 @@
 #include <sound/pcm.h>
 #include <sound/initval.h>
 
+#include <linux/fs.h> 	     /* file stuff */
+#include <linux/kernel.h>    /* printk() */
+#include <linux/errno.h>     /* error codes */
+#include <linux/cdev.h>      /* char device stuff */
+#include <linux/uaccess.h>  /* copy_to_user() */
+
 MODULE_AUTHOR("Giuliano Gambacorta");
 MODULE_DESCRIPTION("FIFO sound card");
 MODULE_LICENSE("GPL");
@@ -98,9 +104,39 @@ struct fifo_pcm
 	unsigned int silent_size;
 };
 
+
+static const char   g_s_Hello_World_string[] = "Hello, world, from kernel mode!\n\0";
+static const ssize_t g_s_Hello_World_size = sizeof(g_s_Hello_World_string);
+
+
+//====================================== CHAR DEVICE ======================================
+static ssize_t device_file_read (struct file *file_ptr,
+                                 char __user *user_buffer,
+                                size_t count,
+                                loff_t *position)
+{
+        printk(KERN_NOTICE "fifo_sound: device file is read at offset = %i, read bytes count = %u",
+        (int)*position,
+        (unsigned int)count);
+        if(*position >= g_s_Hello_World_size)
+        return 0;
+        if (*position + count > g_s_Hello_World_size)
+        count = g_s_Hello_World_size - *position;
+        if (copy_to_user(user_buffer, g_s_Hello_World_string + *position, count) != 0)
+        return -EFAULT;
+        *position += count;
+        return count;
+}
+
+static struct file_operations simple_driver_fops = {
+        .owner = THIS_MODULE,
+        .read = device_file_read,
+};
+
 // ==================================== TEMPORARY =====================================
 static void fifo_timer_start(struct fifo_cable *cable)
 {
+    printk(KERN_WARNING "fifo_timer_start");
 	unsigned long tick;
 	tick = cable->period_size_frac - cable->irq_pos;
 	tick = (tick + cable->pcm_bps - 1) / cable->pcm_bps;
@@ -110,11 +146,13 @@ static void fifo_timer_start(struct fifo_cable *cable)
 
 static void fifo_timer_stop(struct fifo_cable *dev)
 {
+    printk(KERN_WARNING "fifo_timer_stop");
 	del_timer(&dev->timer);
 }
 
 static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
 {
+    printk(KERN_WARNING "fifo_trigger");
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	//struct loopback_pcm *dpcm = runtime->private_data;
 	struct fifo_cable *dev = runtime->private_data; // dpcm->cable;
@@ -144,18 +182,19 @@ static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
  * to required playback ops
  */
 static void copy_play_buf(struct fifo_pcm *play,
-						  struct fifo_pcm *capt,
+						  //struct fifo_pcm *capt,
 						  unsigned int bytes)
 {
+    printk(KERN_WARNING "copy_play_buf");
 	char *src = play->substream->runtime->dma_area;
-	char *dst = capt->substream->runtime->dma_area;
+	//char *dst = capt->substream->runtime->dma_area;
 	unsigned int src_off = play->buf_pos;
-	unsigned int dst_off = capt->buf_pos;
+	//unsigned int dst_off = capt->buf_pos;
 	for (;;) {
 		unsigned int size = bytes;
 		if (src_off + size > play->pcm_buffer_size)
 			size = play->pcm_buffer_size - src_off;
-		if (dst_off + size > capt->pcm_buffer_size)
+		/*if (dst_off + size > capt->pcm_buffer_size)
 			size = capt->pcm_buffer_size - dst_off;
 		memcpy(dst + dst_off, src + src_off, size);
 		if (size < capt->silent_size)
@@ -164,14 +203,18 @@ static void copy_play_buf(struct fifo_pcm *play,
 			capt->silent_size = 0;
 		bytes -= size;
 		if (!bytes)
-			break;
+			break;*/
+        memcpy(g_s_Hello_World_string, src + src_off, size);
 		src_off = (src_off + size) % play->pcm_buffer_size;
-		dst_off = (dst_off + size) % capt->pcm_buffer_size;
+        if (!bytes)
+            break;
+		//dst_off = (dst_off + size) % capt->pcm_buffer_size;
 	}
 }
 
 static int fifo_prepare(struct snd_pcm_substream *substream)
 {
+    printk(KERN_WARNING "fifo_prepare");
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	//struct loopback_pcm *dpcm = runtime->private_data;
 	struct fifo_pcm *dev = runtime->private_data; // dpcm->cable;
@@ -215,6 +258,7 @@ static int fifo_prepare(struct snd_pcm_substream *substream)
 static void fifo_xfer_buf(struct fifo_cable *dev, unsigned int count)
 {
 	int i;
+    printk(KERN_WARNING "fifo_xfer_buf");
 	/*switch (dev->running) {
 		case CABLE_CAPTURE:
 			clear_capture_buf(dev->streams[SNDRV_PCM_STREAM_CAPTURE],
@@ -227,7 +271,7 @@ static void fifo_xfer_buf(struct fifo_cable *dev, unsigned int count)
 			break;
 	}*/
 	copy_play_buf(dev->stream,
-				  dev->stream,
+				  //dev->stream,
 				  count);
 	for (i = 0; i < 2; i++) {
 		if (dev->running & (1 << i)) {
@@ -240,6 +284,7 @@ static void fifo_xfer_buf(struct fifo_cable *dev, unsigned int count)
 
 static void fifo_pos_update(struct fifo_cable *cable)
 {
+    printk(KERN_WARNING "fifo_pos_update");
 	unsigned int last_pos, count;
 	unsigned long delta;
 	if (!cable->running)
@@ -262,6 +307,7 @@ static void fifo_pos_update(struct fifo_cable *cable)
 
 static void fifo_timer_function(unsigned long data)
 {
+    printk(KERN_WARNING "fifo_timer_function");
 	struct fifo_cable *cable = (struct fifo_cable *)data;
 	int i;
 	if (!cable->running)
@@ -281,6 +327,7 @@ static void fifo_timer_function(unsigned long data)
 
 static snd_pcm_uframes_t fifo_pointer(struct snd_pcm_substream *substream)
 {
+    printk(KERN_WARNING "fifo_pointer");
 	struct snd_pcm_runtime *runtime = substream->runtime;
 	struct fifo_pcm *dpcm = runtime->private_data;
 	fifo_pos_update(dpcm->cable);
@@ -343,8 +390,8 @@ static struct snd_pcm_ops fifo_pcm_playback_ops =
 	.hw_params = fifo_hw_params,
 	.hw_free   = fifo_hw_free,
 	.prepare   = fifo_pcm_prepare,
-	.trigger   = fifo_pcm_trigger,
-	.pointer   = fifo_pcm_pointer,
+	.trigger   = fifo_trigger,
+	.pointer   = fifo_pointer,
 };
 
 // specifies what func is called @ snd_card_free
@@ -371,7 +418,7 @@ static int fifo_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	int ret = 0;
 	struct fifo_device *mydev = substream->private_data;
-	printk(KERN_WARNING "TRIGGERING this beautiful useless device");
+	printk(KERN_WARNING "fifo_pcm_trigger");
 
 	switch (cmd)
 	{
@@ -392,7 +439,7 @@ static snd_pcm_uframes_t fifo_pcm_pointer(struct snd_pcm_substream *ss)
     struct snd_pcm_runtime *runtime = ss->runtime;
     struct fifo_device *mydev = runtime->private_data;
 
-	printk(KERN_WARNING "POINTING this beautiful useless device somewhere");
+	printk(KERN_WARNING "fifo_pcm_pointer");
 
     //fifo_pos_update(mydev);
 
@@ -403,12 +450,14 @@ static snd_pcm_uframes_t fifo_pcm_pointer(struct snd_pcm_substream *ss)
 static int fifo_hw_params(struct snd_pcm_substream *ss,
                         struct snd_pcm_hw_params *hw_params)
 {
+    printk(KERN_WARNING "fifo_hw_params");
 	return snd_pcm_lib_malloc_pages(ss,
 	                                params_buffer_bytes(hw_params));
 }
 
 static int fifo_hw_free(struct snd_pcm_substream *ss)
 {
+    printk(KERN_WARNING "fifo_hw_free");
 	return snd_pcm_lib_free_pages(ss);
 }
 
@@ -416,7 +465,7 @@ static int fifo_pcm_open(struct snd_pcm_substream *ss)
 {
 	struct fifo_pcm *dpcm;
 	struct fifo_device *mydev = ss->private_data;
-    printk(KERN_WARNING "opening this beautiful useless device");
+    printk(KERN_WARNING "fifo_pcm_open");
 
     mutex_lock(&mydev->cable_lock);
 
@@ -434,7 +483,7 @@ static int fifo_pcm_open(struct snd_pcm_substream *ss)
 static int fifo_pcm_close(struct snd_pcm_substream *ss)
 {
     struct fifo_device *mydev = ss->private_data;
-    printk(KERN_WARNING "closing this beautiful useless device");
+    printk(KERN_WARNING "fifo_pcm_close");
 
     mutex_lock(&mydev->cable_lock);
 
@@ -452,7 +501,7 @@ static int fifo_pcm_prepare(struct snd_pcm_substream *ss)
 	struct fifo_pcm *mydev = runtime->private_data;
 	unsigned int bps;
 
-    printk(KERN_WARNING "PREPARE");
+    printk(KERN_WARNING "fifo_pcm_prepare");
 
     mydev->buf_pos = 0;
 
@@ -472,11 +521,13 @@ static int fifo_pcm_prepare(struct snd_pcm_substream *ss)
 
 static int fifo_pcm_free(struct fifo_device *chip)
 {
+    printk(KERN_WARNING "fifo_pcm_free");
 	return 0;
 }
 
 static int fifo_pcm_dev_free(struct snd_device *device)
 {
+    printk(KERN_WARNING "fifo_pcm_dev_free");
 	return fifo_pcm_free(device->device_data);
 }
 // ======================== DEVICE DRIVER OPERATIONS ==================================
@@ -491,7 +542,7 @@ static int fifo_probe(struct platform_device *devptr)
 
 	int nr_subdevs = 1; // how many playback substreams we want
 
-    printk(KERN_WARNING "probing this beautiful useless device");
+    printk(KERN_WARNING "fifo_probe");
 
 	// sound card creation
 	ret = snd_card_new(&devptr->dev, index[dev], id[dev], THIS_MODULE,
@@ -542,6 +593,18 @@ static int fifo_probe(struct platform_device *devptr)
 
     printk(KERN_WARNING "REGISTERED CARD");
 
+
+    int result = 0;
+    printk(KERN_NOTICE "fifo-soundcard: register_device() il called.");
+
+    result = register_chrdev(0, "fifo-soundcard", &simple_driver_fops);
+
+    if (result < 0)
+    {
+        printk(KERN_WARNING "Simple-driver: can\'t register character device with errorcode = %i", result);
+        return result;
+    }
+
 	if (ret == 0)   // or... (!ret)
 	{
 		platform_set_drvdata(devptr, card);
@@ -575,7 +638,7 @@ static void fifo_unregister_all(void)
 static int __init alsa_card_fifo_init(void)
 {
 	int i, err, cards;
-    printk(KERN_WARNING "init this beautiful useless device");
+    printk(KERN_WARNING "alsa_card_fifo_init");
 
 	err = platform_driver_register(&fifo_driver);
 	if (err < 0)
@@ -620,6 +683,9 @@ static void __exit alsa_card_fifo_exit(void)
 {
 	fifo_unregister_all();
 }
+
+
+
 
 // ====================================================================================
 module_init(alsa_card_fifo_init)
