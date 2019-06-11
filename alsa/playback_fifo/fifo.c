@@ -26,17 +26,17 @@
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
 #include <linux/jiffies.h>
-
-#include <sound/core.h>
-#include <sound/control.h>
-#include <sound/pcm.h>
-#include <sound/initval.h>
-
 #include <linux/fs.h> 	     /* file stuff */
 #include <linux/kernel.h>    /* printk() */
 #include <linux/errno.h>     /* error codes */
 #include <linux/cdev.h>      /* char device stuff */
 #include <linux/uaccess.h>  /* copy_to_user() */
+#include <linux/slab.h>
+
+#include <sound/core.h>
+#include <sound/control.h>
+#include <sound/pcm.h>
+#include <sound/initval.h>
 
 MODULE_AUTHOR("Giuliano Gambacorta");
 MODULE_DESCRIPTION("FIFO sound card");
@@ -90,11 +90,14 @@ struct fifo_snd_device
     /* added for waveform: */
 };
 
+static int device_file_major_number = 0;
 static const char   g_s_Hello_World_string[] = "Hello, world, from kernel mode!\n\0";
+static char *memory_buffer;
 static const ssize_t g_s_Hello_World_size = sizeof(g_s_Hello_World_string);
 
 
 //====================================== CHAR DEVICE ======================================
+//TODO check if possible to let dimension correspond to alsa buffer size
 static ssize_t device_file_read (struct file *file_ptr,
                                  char __user *user_buffer,
                                 size_t count,
@@ -103,13 +106,15 @@ static ssize_t device_file_read (struct file *file_ptr,
         printk(KERN_NOTICE "fifo_sound: device file is read at offset = %i, read bytes count = %u",
         (int)*position,
         (unsigned int)count);
-        if(*position >= g_s_Hello_World_size)
-        return 0;
-        if (*position + count > g_s_Hello_World_size)
-        count = g_s_Hello_World_size - *position;
-        if (copy_to_user(user_buffer, g_s_Hello_World_string + *position, count) != 0)
-        return -EFAULT;
-        *position += count;
+        int dimension = sizeof(memory_buffer);
+        /*if(*position >= memory_buffer_size)
+            return 0;
+        if (*position + count > memory_buffer_size)
+        count = memory_buffer_size - *position;*/
+        if (copy_to_user(user_buffer, memory_buffer, dimension) != 0)
+            return -EFAULT;
+
+        memset(memory_buffer, 0, dimension);
         return count;
 }
 
@@ -145,24 +150,25 @@ static int fifo_trigger(struct snd_pcm_substream *substream, int cmd)
 }
 
 /*
- * TODO rewrite this to copy on a file instead that on another pcm device, follow calls
- * to required playback ops
+ * TODO set proper copy algorithm checking update in buffer on aloop and minivosc
  */
 static void copy_play_buf(struct fifo_snd_device *play,
 						  unsigned int bytes)
 {
     printk(KERN_WARNING "copy_play_buf");
 	char *src = play->substream->runtime->dma_area;
+    memory_buffer = kmalloc(play->pcm_buffer_size, GFP_KERNEL);
 
 	unsigned int src_off = play->buf_pos;
-
 	for (;;) {
 		unsigned int size = bytes;
 		if (src_off + size > play->pcm_buffer_size)
-			size = play->pcm_buffer_size - src_off;
+        {
+            size = play->pcm_buffer_size - src_off;
+        }
 
-        memcpy(g_s_Hello_World_string, src + src_off, size);
-
+        memcpy(memory_buffer, src + src_off, size);
+        printk(KERN_WARNING "copy done");
         bytes -= size;
         if (!bytes)
             break;
@@ -171,19 +177,21 @@ static void copy_play_buf(struct fifo_snd_device *play,
 	}
 }
 
+#define CABLE_PLAYBACK	(1 << SNDRV_PCM_STREAM_PLAYBACK)
+
 static void fifo_xfer_buf(struct fifo_snd_device *dev, unsigned int count)
 {
-	int i;
     printk(KERN_WARNING "fifo_xfer_buf");
 
-	copy_play_buf(dev,
-				  count);
-	for (i = 0; i < 2; i++) {
-		if (dev->running & (1 << i)) {
-			dev->buf_pos += count;
-			dev->buf_pos %= dev->pcm_buffer_size;
-		}
-	}
+    switch (dev->running){
+        case CABLE_PLAYBACK:
+            copy_play_buf(dev, count);
+            break;
+    }
+    if (dev->running) {
+        dev->buf_pos += count;
+        dev->buf_pos %= dev->pcm_buffer_size;
+    }
 }
 
 static void fifo_pos_update(struct fifo_snd_device *cable)
@@ -458,9 +466,14 @@ static int fifo_probe(struct platform_device *devptr)
 
 
     int result = 0;
-    printk(KERN_NOTICE "fifo-soundcard: register_device() il called.");
+    printk(KERN_NOTICE "fifo-soundcard: register_device() is called.");
 
     result = register_chrdev(0, "fifo-soundcard", &simple_driver_fops);
+
+    device_file_major_number = result;
+
+    memory_buffer = kmalloc(1, GFP_KERNEL);
+    memset(memory_buffer, 0, 1);
 
     if (result < 0)
     {
@@ -482,6 +495,7 @@ __nodev: // as in aloop/dummy...
 static int fifo_remove(struct platform_device *devptr)
 {
 	snd_card_free(platform_get_drvdata(devptr));
+    unregister_chrdev(device_file_major_number, "fifo-soundcard");
 	platform_set_drvdata(devptr, NULL);
 	return 0;
 }
@@ -489,8 +503,6 @@ static int fifo_remove(struct platform_device *devptr)
 // INIT FUNCTIONS
 static void fifo_unregister_all(void)
 {
-    int i;
-
     platform_device_unregister(device);
 
     platform_driver_unregister(&fifo_driver);
