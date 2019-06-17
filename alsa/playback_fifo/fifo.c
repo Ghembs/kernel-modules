@@ -373,6 +373,8 @@ static snd_pcm_uframes_t fifo_pointer(struct snd_pcm_substream *substream)
     struct fifo_snd_device *dpcm = runtime->private_data;
 
     printk(KERN_WARNING "fifo_pointer");
+    printk(KERN_WARNING "rate: %i", runtime->rate);
+    printk(KERN_WARNING "format: %d", runtime->format);
     fifo_pos_update(dpcm);
     return bytes_to_frames(runtime, dpcm->buf_pos);
 }
